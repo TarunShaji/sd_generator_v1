@@ -1,0 +1,6 @@
+# Pipeline modules directory
+# Phase 2 will add:
+# - ingestion.ts
+# - cleaning.ts
+# - extraction.ts
+# - validator.ts

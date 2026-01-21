@@ -6,22 +6,111 @@ const urlString = z.string().url().nullable().describe("Must be an absolute URL.
 const isoDate = z.string().nullable().describe("Prefer ISO 8601 format (YYYY-MM-DD).");
 const personOrOrg = z.object({ type: z.enum(['Person', 'Organization']).nullable(), name: z.string().nullable(), url: urlString }).nullable();
 
-// --- 1. Product ---
-const ProductSchema = z.object({
-  name: z.string().nullable(),
-  description: z.string().nullable(),
-  image: z.array(z.string()).nullable(),
+// --- 1. Product (Enhanced) ---
+// Covers Google Rich Results requirements + common real-world fields
+const BrandSchema = z.object({
+  name: z.string().nullable()
+}).nullable();
+
+const AggregateRatingSchema = z.object({
+  ratingValue: numericString,
+  reviewCount: numericString,
+  bestRating: numericString,  // Usually 5
+  worstRating: numericString  // Usually 1
+}).nullable();
+
+const OfferSchema = z.object({
+  // REQUIRED fields
+  price: numericString,
+  priceCurrency: z.string().nullable(),
+  availability: z.enum([
+    'https://schema.org/InStock',
+    'https://schema.org/OutOfStock',
+    'https://schema.org/PreOrder',
+    'https://schema.org/SoldOut',
+    'https://schema.org/BackOrder',
+    'https://schema.org/Discontinued',
+    'https://schema.org/LimitedAvailability'
+  ]).nullable(),
+
+  // RECOMMENDED fields
+  url: urlString,
+  priceValidUntil: isoDate,
+  itemCondition: z.enum([
+    'https://schema.org/NewCondition',
+    'https://schema.org/UsedCondition',
+    'https://schema.org/RefurbishedCondition',
+    'https://schema.org/DamagedCondition'
+  ]).nullable(),
+
+  // Additional useful fields
   sku: z.string().nullable(),
-  gtin: z.string().nullable(),
-  brand: z.object({ name: z.string().nullable() }).nullable(),
-  offers: z.object({
-    price: numericString,
-    priceCurrency: z.string().nullable(),
-    availability: z.enum(['https://schema.org/InStock', 'https://schema.org/OutOfStock', 'https://schema.org/PreOrder', 'https://schema.org/SoldOut']).nullable(),
-    url: urlString
+  seller: z.object({ name: z.string().nullable() }).nullable(),
+  shippingDetails: z.object({
+    shippingRate: z.object({
+      value: numericString,
+      currency: z.string().nullable()
+    }).nullable(),
+    deliveryTime: z.object({
+      minValue: numericString,
+      maxValue: numericString,
+      unitCode: z.string().nullable()  // e.g., "DAY"
+    }).nullable()
   }).nullable(),
-  aggregateRating: z.object({ ratingValue: numericString, reviewCount: numericString }).nullable()
+  hasMerchantReturnPolicy: z.object({
+    returnPolicyCategory: z.enum([
+      'https://schema.org/MerchantReturnFiniteReturnWindow',
+      'https://schema.org/MerchantReturnNotPermitted',
+      'https://schema.org/MerchantReturnUnlimitedWindow'
+    ]).nullable(),
+    merchantReturnDays: numericString
+  }).nullable()
+}).nullable();
+
+const ProductSchema = z.object({
+  // REQUIRED
+  name: z.string().nullable(),
+  image: z.array(z.string()).nullable(),
+
+  // RECOMMENDED  
+  description: z.string().nullable(),
+  brand: BrandSchema,
+  offers: z.union([OfferSchema, z.array(OfferSchema)]).nullable(),
+  aggregateRating: AggregateRatingSchema,
+
+  // Identifiers (important for e-commerce)
+  sku: z.string().nullable(),
+  gtin: z.string().nullable(),        // GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), GTIN-14
+  mpn: z.string().nullable(),         // Manufacturer Part Number
+  productID: z.string().nullable(),   // Generic product ID
+
+  // Product variants/attributes
+  color: z.string().nullable(),
+  size: z.string().nullable(),
+  material: z.string().nullable(),
+  pattern: z.string().nullable(),
+
+  // Physical properties
+  weight: z.object({
+    value: numericString,
+    unitCode: z.string().nullable()   // e.g., "KGM", "LBR"
+  }).nullable(),
+
+  // Category
+  category: z.string().nullable(),     // Product category/type
+
+  // Reviews
+  review: z.array(z.object({
+    author: z.object({ name: z.string().nullable() }).nullable(),
+    reviewRating: z.object({
+      ratingValue: numericString,
+      bestRating: numericString
+    }).nullable(),
+    reviewBody: z.string().nullable(),
+    datePublished: isoDate
+  })).nullable()
 });
+
 
 // --- 2. Recipe ---
 const RecipeSchema = z.object({
@@ -59,15 +148,61 @@ const LocalBusinessSchema = z.object({
   priceRange: z.string().nullable()
 });
 
-// --- 5. Article ---
+// --- 5. Article (Enhanced) ---
+// Supports E-E-A-T requirements, Google News, and rich snippets
+// Simplified for AI compatibility while keeping all enhanced fields
+
 const ArticleSchema = z.object({
+  // HEADLINES & DESCRIPTION
   headline: z.string().nullable(),
+  alternativeHeadline: z.string().nullable(),
+  description: z.string().nullable(),
+
+  // IMAGES (simplified - array of URLs)
   image: z.array(z.string()).nullable(),
-  author: personOrOrg,
-  publisher: personOrOrg,
+
+  // E-E-A-T: AUTHORSHIP (simplified - single author or first author for multi-author)
+  author: z.object({
+    type: z.enum(['Person', 'Organization']).nullable(),
+    name: z.string().nullable(),
+    url: urlString
+  }).nullable(),
+
+  // Additional authors for co-authored articles
+  additionalAuthors: z.array(z.object({
+    type: z.enum(['Person', 'Organization']).nullable(),
+    name: z.string().nullable(),
+    url: urlString
+  })).nullable(),
+
+  // PUBLISHER
+  publisher: z.object({
+    name: z.string().nullable(),
+    logoUrl: urlString,
+    logoWidth: numericString,
+    logoHeight: numericString
+  }).nullable(),
+
+  // DATES
   datePublished: isoDate,
   dateModified: isoDate,
-  description: z.string().nullable()
+
+  // CONTENT METRICS & CATEGORIES
+  articleSection: z.string().nullable(),  // Primary category
+  keywords: z.array(z.string()).nullable(),
+  wordCount: numericString,
+
+  // PAYWALL / ACCESS
+  isAccessibleForFree: z.boolean().nullable(),
+
+  // SEO TECHNICALS
+  mainEntityOfPage: urlString,
+
+  // ADDITIONAL USEFUL FIELDS
+  inLanguage: z.string().nullable(),
+  copyrightHolder: z.string().nullable(),
+  copyrightYear: numericString,
+  thumbnailUrl: urlString
 });
 
 // --- 6. FAQ Page ---

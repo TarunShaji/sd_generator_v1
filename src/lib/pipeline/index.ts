@@ -273,7 +273,7 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
 
     // Step 4: Validation
     const validationStart = Date.now();
-    const validationResult = validate(extractionResult.data);
+    const validationResult = validate(extractionResult.data, successIngestion.finalUrl);
     const validationTimeMs = Date.now() - validationStart;
 
     // Save Step 4 output: Final JSON-LD

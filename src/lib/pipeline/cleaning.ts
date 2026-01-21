@@ -84,8 +84,8 @@ const HIDDEN_SELECTORS = [
     '[style*="visibility: hidden"]', '[style*="visibility:hidden"]'
 ];
 
-// Minimum text length for paragraphs
-const MIN_PARAGRAPH_LENGTH = 20;
+// Minimum text length for paragraphs (low threshold to capture prices like "$24")
+const MIN_PARAGRAPH_LENGTH = 2;
 
 /**
  * Clean the DOM and extract structured content.

@@ -54,23 +54,35 @@ function repairPrice(value: string | number | null): number | null {
 
 /**
  * Repair URL - ensure absolute URL
+ * Handles:
+ * - Protocol-relative URLs: //domain.com/path → https://domain.com/path
+ * - Relative URLs: /path/to/image.jpg → https://baseUrl/path/to/image.jpg
+ * - Already absolute URLs: return as-is
  */
 function repairUrl(url: string | null, baseUrl?: string): string | null {
     if (!url) return null;
 
     try {
+        // Handle protocol-relative URLs (//domain.com/path)
+        if (url.startsWith('//')) {
+            const absoluteUrl = 'https:' + url;
+            new URL(absoluteUrl); // Validate
+            return absoluteUrl;
+        }
+
         // If already absolute, validate it
         if (url.startsWith('http://') || url.startsWith('https://')) {
             new URL(url);
             return url;
         }
 
-        // Try to make relative URL absolute
+        // Try to make relative URL absolute using base URL
         if (baseUrl) {
             const absolute = new URL(url, baseUrl);
             return absolute.href;
         }
 
+        // Can't resolve without base URL
         return null;
     } catch {
         return null;
@@ -97,7 +109,7 @@ function repairDate(date: string | null): string | null {
 /**
  * Build JSON-LD from extraction result
  */
-function buildJsonLd(data: ExtractionResult, repairs: string[]): object {
+function buildJsonLd(data: ExtractionResult, repairs: string[], pageUrl?: string): object {
     const type = data.detectedType;
 
     const base = {
@@ -112,33 +124,93 @@ function buildJsonLd(data: ExtractionResult, repairs: string[]): object {
 
             const jsonLd: Record<string, unknown> = { ...base };
 
+            // Required/Recommended fields
             if (p.name) jsonLd.name = p.name;
             if (p.description) jsonLd.description = p.description;
-            if (p.image?.length) jsonLd.image = p.image;
-            if (p.sku) jsonLd.sku = p.sku;
-            if (p.gtin) jsonLd.gtin = p.gtin;
+            if (p.image?.length) {
+                jsonLd.image = p.image.map(img => repairUrl(img, pageUrl)).filter(Boolean);
+            }
             if (p.brand?.name) jsonLd.brand = { '@type': 'Brand', name: p.brand.name };
 
-            if (p.offers) {
-                const offer: Record<string, unknown> = { '@type': 'Offer' };
-                const price = repairPrice(p.offers.price);
-                if (price !== null) {
-                    offer.price = price;
-                    repairs.push(`Repaired price: ${p.offers.price} → ${price}`);
-                }
-                if (p.offers.priceCurrency) offer.priceCurrency = p.offers.priceCurrency;
-                if (p.offers.availability) offer.availability = p.offers.availability;
-                if (p.offers.url) offer.url = p.offers.url;
-                jsonLd.offers = offer;
+            // Identifiers
+            if (p.sku) jsonLd.sku = p.sku;
+            if (p.gtin) jsonLd.gtin = p.gtin;
+            if (p.mpn) jsonLd.mpn = p.mpn;
+            if (p.productID) jsonLd.productID = p.productID;
+
+            // Variant attributes
+            if (p.color) jsonLd.color = p.color;
+            if (p.size) jsonLd.size = p.size;
+            if (p.material) jsonLd.material = p.material;
+            if (p.pattern) jsonLd.pattern = p.pattern;
+            if (p.category) jsonLd.category = p.category;
+
+            // Physical properties
+            if (p.weight && p.weight.value !== null) {
+                jsonLd.weight = {
+                    '@type': 'QuantitativeValue',
+                    value: repairPrice(p.weight.value),
+                    unitCode: p.weight.unitCode
+                };
             }
 
+            // Offers - handle single or array
+            if (p.offers) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const buildOffer = (offer: any) => {
+                    if (!offer) return null;
+                    const o: Record<string, unknown> = { '@type': 'Offer' };
+                    const price = repairPrice(offer.price);
+                    if (price !== null) {
+                        o.price = price;
+                        repairs.push(`Repaired price: ${offer.price} → ${price}`);
+                    }
+                    if (offer.priceCurrency) o.priceCurrency = offer.priceCurrency;
+                    if (offer.availability) o.availability = offer.availability;
+                    if (offer.url) o.url = repairUrl(offer.url, pageUrl);
+                    if (offer.priceValidUntil) o.priceValidUntil = repairDate(offer.priceValidUntil);
+                    if (offer.itemCondition) o.itemCondition = offer.itemCondition;
+                    if (offer.sku) o.sku = offer.sku;
+                    if (offer.seller?.name) o.seller = { '@type': 'Organization', name: offer.seller.name };
+                    return o;
+                };
+
+                if (Array.isArray(p.offers)) {
+                    const offers = p.offers.filter(Boolean).map(buildOffer).filter(Boolean);
+                    if (offers.length > 0) jsonLd.offers = offers;
+                } else {
+                    const offer = buildOffer(p.offers);
+                    if (offer) jsonLd.offers = offer;
+                }
+            }
+
+            // Aggregate Rating
             if (p.aggregateRating) {
                 const rating: Record<string, unknown> = { '@type': 'AggregateRating' };
                 const ratingValue = repairPrice(p.aggregateRating.ratingValue);
                 const reviewCount = repairPrice(p.aggregateRating.reviewCount);
+                const bestRating = repairPrice(p.aggregateRating.bestRating);
+                const worstRating = repairPrice(p.aggregateRating.worstRating);
                 if (ratingValue !== null) rating.ratingValue = ratingValue;
                 if (reviewCount !== null) rating.reviewCount = Math.floor(reviewCount);
+                if (bestRating !== null) rating.bestRating = bestRating;
+                if (worstRating !== null) rating.worstRating = worstRating;
                 jsonLd.aggregateRating = rating;
+            }
+
+            // Reviews
+            if (p.review?.length) {
+                jsonLd.review = p.review.filter(Boolean).map(r => ({
+                    '@type': 'Review',
+                    author: r.author?.name ? { '@type': 'Person', name: r.author.name } : undefined,
+                    reviewRating: r.reviewRating ? {
+                        '@type': 'Rating',
+                        ratingValue: repairPrice(r.reviewRating.ratingValue),
+                        bestRating: repairPrice(r.reviewRating.bestRating)
+                    } : undefined,
+                    reviewBody: r.reviewBody,
+                    datePublished: repairDate(r.datePublished)
+                }));
             }
 
             return jsonLd;
@@ -239,17 +311,79 @@ function buildJsonLd(data: ExtractionResult, repairs: string[]): object {
 
             const jsonLd: Record<string, unknown> = { ...base };
 
+            // Headlines & Description
             if (a.headline) jsonLd.headline = a.headline;
-            if (a.image?.length) jsonLd.image = a.image;
+            if (a.alternativeHeadline) jsonLd.alternativeHeadline = a.alternativeHeadline;
+            if (a.description) jsonLd.description = a.description;
+
+            // Images (array of URLs)
+            if (a.image?.length) {
+                jsonLd.image = a.image.map(img => repairUrl(img, pageUrl)).filter(Boolean);
+            }
+
+            // Author handling (primary author)
             if (a.author?.name) {
-                jsonLd.author = { '@type': a.author.type || 'Person', name: a.author.name };
+                const author = {
+                    '@type': a.author.type || 'Person',
+                    name: a.author.name,
+                    url: repairUrl(a.author.url, pageUrl)
+                };
+
+                // Check for additional authors (co-authors)
+                if (a.additionalAuthors?.length) {
+                    const allAuthors = [author, ...a.additionalAuthors
+                        .filter((aa: { name: string | null }) => aa?.name)
+                        .map((aa: { type: string | null; name: string | null; url: string | null }) => ({
+                            '@type': aa.type || 'Person',
+                            name: aa.name,
+                            url: aa.url
+                        }))
+                    ];
+                    jsonLd.author = allAuthors;
+                } else {
+                    jsonLd.author = author;
+                }
             }
+
+            // Publisher with logo
             if (a.publisher?.name) {
-                jsonLd.publisher = { '@type': a.publisher.type || 'Organization', name: a.publisher.name };
+                const publisher: Record<string, unknown> = {
+                    '@type': 'Organization',
+                    name: a.publisher.name
+                };
+                if (a.publisher.logoUrl) {
+                    publisher.logo = {
+                        '@type': 'ImageObject',
+                        url: repairUrl(a.publisher.logoUrl, pageUrl),
+                        width: repairPrice(a.publisher.logoWidth),
+                        height: repairPrice(a.publisher.logoHeight)
+                    };
+                }
+                jsonLd.publisher = publisher;
             }
+
+            // Dates
             if (a.datePublished) jsonLd.datePublished = repairDate(a.datePublished);
             if (a.dateModified) jsonLd.dateModified = repairDate(a.dateModified);
-            if (a.description) jsonLd.description = a.description;
+
+            // Content metrics & categories
+            if (a.articleSection) jsonLd.articleSection = a.articleSection;
+            if (a.keywords?.length) jsonLd.keywords = a.keywords;
+            if (a.wordCount) jsonLd.wordCount = repairPrice(a.wordCount);
+
+            // Paywall / Access
+            if (a.isAccessibleForFree !== null && a.isAccessibleForFree !== undefined) {
+                jsonLd.isAccessibleForFree = a.isAccessibleForFree;
+            }
+
+            // SEO technicals
+            if (a.mainEntityOfPage) jsonLd.mainEntityOfPage = repairUrl(a.mainEntityOfPage, pageUrl);
+
+            // Additional fields
+            if (a.inLanguage) jsonLd.inLanguage = a.inLanguage;
+            if (a.copyrightHolder) jsonLd.copyrightHolder = a.copyrightHolder;
+            if (a.copyrightYear) jsonLd.copyrightYear = repairPrice(a.copyrightYear);
+            if (a.thumbnailUrl) jsonLd.thumbnailUrl = repairUrl(a.thumbnailUrl, pageUrl);
 
             return jsonLd;
         }
@@ -370,7 +504,7 @@ function checkRequiredFields(data: ExtractionResult): string | null {
 /**
  * Validate and build final JSON-LD output
  */
-export function validate(data: ExtractionResult): ValidationSuccess | ValidationError {
+export function validate(data: ExtractionResult, pageUrl?: string): ValidationSuccess | ValidationError {
     const log = logger.scoped('Validator');
     const repairs: string[] = [];
 
@@ -407,7 +541,7 @@ export function validate(data: ExtractionResult): ValidationSuccess | Validation
 
         // Step 3: Build JSON-LD with repairs
         log.debug('Building JSON-LD with repairs');
-        const jsonLd = buildJsonLd(data, repairs);
+        const jsonLd = buildJsonLd(data, repairs, pageUrl);
 
         // Step 4: Freeze output
         const frozen = Object.freeze(jsonLd);

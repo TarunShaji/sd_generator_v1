@@ -15,6 +15,7 @@ import {
   Sparkles,
   ChevronDown,
   ChevronUp,
+  XCircle,
 } from "lucide-react";
 
 interface LogEntry {
@@ -25,10 +26,20 @@ interface LogEntry {
   metadata?: Record<string, unknown>;
 }
 
+interface RejectedEntity {
+  type: string;
+  reason: string;
+}
+
 interface PipelineResult {
   success: boolean;
-  jsonLd?: object;
-  detectedType?: string;
+  // New separate arrays
+  acceptedEntities?: object[];
+  rejectedEntities?: RejectedEntity[];
+  // Legacy/Alias
+  jsonLd?: object[];
+  entityTypes?: string[];
+
   repairs?: string[];
   logs: LogEntry[];
   stats?: {
@@ -62,7 +73,7 @@ function LogLevelIcon({ level }: { level: LogEntry["level"] }) {
 
 function LogConsole({ logs }: { logs: LogEntry[] }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [isExpanded, setIsExpanded] = useState(true);
+  const [isExpanded, setIsExpanded] = useState(false);
 
   useEffect(() => {
     if (containerRef.current && isExpanded) {
@@ -100,10 +111,10 @@ function LogConsole({ logs }: { logs: LogEntry[] }) {
             <div
               key={index}
               className={`flex items-start gap-2 py-1 ${log.level === "ERROR"
-                  ? "bg-red-500/10 -mx-4 px-4"
-                  : log.level === "WARN"
-                    ? "bg-amber-500/10 -mx-4 px-4"
-                    : ""
+                ? "bg-red-500/10 -mx-4 px-4"
+                : log.level === "WARN"
+                  ? "bg-amber-500/10 -mx-4 px-4"
+                  : ""
                 }`}
             >
               <LogLevelIcon level={log.level} />
@@ -127,10 +138,12 @@ function LogConsole({ logs }: { logs: LogEntry[] }) {
 
 function JsonLdOutput({
   jsonLd,
-  detectedType,
+  type,
+  index
 }: {
   jsonLd: object;
-  detectedType: string;
+  type: string;
+  index: number;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -149,15 +162,15 @@ function JsonLdOutput({
   };
 
   return (
-    <div className="glass rounded-xl overflow-hidden">
+    <div className="glass rounded-xl overflow-hidden mb-4">
       <div className="flex items-center justify-between p-4 border-b border-card-border">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-success/20 flex items-center justify-center">
             <CheckCircle className="w-4 h-4 text-success" />
           </div>
           <div>
-            <h3 className="font-semibold">Generated JSON-LD</h3>
-            <p className="text-sm text-muted">Schema Type: {detectedType}</p>
+            <h3 className="font-semibold">{type} Entity</h3>
+            <p className="text-sm text-muted">Result #{index + 1}</p>
           </div>
         </div>
         <button
@@ -203,6 +216,30 @@ function JsonLdOutput({
             <span className="text-muted">&lt;/script&gt;</span>
           </code>
         </pre>
+      </div>
+    </div>
+  );
+}
+
+function RejectedEntitiesDisplay({ rejected }: { rejected: RejectedEntity[] }) {
+  if (!rejected || rejected.length === 0) return null;
+
+  return (
+    <div className="glass rounded-xl overflow-hidden mb-6 border border-error/30">
+      <div className="p-4 bg-error/10 border-b border-error/20 flex items-center gap-3">
+        <AlertCircle className="w-5 h-5 text-error" />
+        <h3 className="font-semibold text-error">Rejected Entities ({rejected.length})</h3>
+      </div>
+      <div className="p-4 space-y-3">
+        {rejected.map((item, i) => (
+          <div key={i} className="flex items-start gap-3 p-3 rounded-lg bg-black/20">
+            <XCircle className="w-4 h-4 text-error mt-0.5" />
+            <div>
+              <p className="font-medium text-foreground">{item.type}</p>
+              <p className="text-sm text-error/90">{item.reason}</p>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -277,7 +314,8 @@ export default function Home() {
       setResult(data);
 
       if (data.success) {
-        toast.success(`Generated ${data.detectedType} schema!`);
+        const count = data.acceptedEntities?.length || data.jsonLd?.length || 0;
+        toast.success(`Success! Generated ${count} entities.`);
       } else {
         toast.error(`Failed at ${data.stage}: ${data.reason}`);
       }
@@ -289,6 +327,8 @@ export default function Home() {
         stage: "network",
         reason: message,
         logs: [],
+        acceptedEntities: [],
+        rejectedEntities: []
       });
     } finally {
       setLoading(false);
@@ -333,8 +373,8 @@ export default function Home() {
               type="submit"
               disabled={loading}
               className={`px-8 py-4 rounded-xl font-semibold text-white transition-all flex items-center justify-center gap-2 min-w-[160px] ${loading
-                  ? "bg-primary/50 cursor-not-allowed"
-                  : "bg-primary hover:bg-primary-hover pulse-glow"
+                ? "bg-primary/50 cursor-not-allowed"
+                : "bg-primary hover:bg-primary-hover pulse-glow"
                 }`}
             >
               {loading ? (
@@ -375,9 +415,34 @@ export default function Home() {
               </div>
             )}
 
-            {/* JSON-LD Output */}
-            {result.success && result.jsonLd && result.detectedType && (
-              <JsonLdOutput jsonLd={result.jsonLd} detectedType={result.detectedType} />
+            {/* Rejected Entities */}
+            {result.rejectedEntities && result.rejectedEntities.length > 0 && (
+              <RejectedEntitiesDisplay rejected={result.rejectedEntities} />
+            )}
+
+            {/* Accepted JSON-LD Output */}
+            {result.success && (result.acceptedEntities || result.jsonLd) && (
+              <div>
+                <h2 className="text-xl font-semibold mb-4 text-foreground flex items-center gap-2">
+                  <CheckCircle className="w-5 h-5 text-success" />
+                  Generated Entities
+                </h2>
+
+                {(result.acceptedEntities || result.jsonLd || []).length === 0 ? (
+                  <div className="glass rounded-xl p-6 text-center text-muted">
+                    No valid entities extracted.
+                  </div>
+                ) : (
+                  (result.acceptedEntities || result.jsonLd || []).map((entity: any, i: number) => (
+                    <JsonLdOutput
+                      key={i}
+                      jsonLd={entity}
+                      type={entity['@type'] || 'Unknown'}
+                      index={i}
+                    />
+                  ))
+                )}
+              </div>
             )}
 
             {/* Repairs */}

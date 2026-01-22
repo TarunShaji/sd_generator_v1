@@ -2,6 +2,7 @@
  * Pipeline Step 2: Cleaning
  * 
  * Deterministic DOM cleaning to produce high-signal textual representation.
+ * SINGLE SOURCE OF TRUTH for all text extraction.
  * NO inference, NO enrichment - just what is visibly there.
  */
 
@@ -28,8 +29,19 @@ export interface ImageElement {
     alt: string | null;
 }
 
+export interface LinkElement {
+    text: string;
+    href: string;
+}
+
 export interface ButtonElement {
     text: string;
+}
+
+export interface MetaElement {
+    name: string | null;
+    property: string | null;
+    content: string;
 }
 
 export interface CleaningResult {
@@ -39,7 +51,11 @@ export interface CleaningResult {
     lists: ListElement[];
     tables: TableElement[];
     images: ImageElement[];
+    links: LinkElement[];
     buttons: ButtonElement[];
+    meta: MetaElement[];
+    // DISABLED: JSON-LD extraction temporarily disabled for evaluation
+    // jsonLd: object[];
     stats: {
         originalLength: number;
         cleanedLength: number;
@@ -56,7 +72,8 @@ export interface CleaningError {
 
 // Elements to completely remove
 const REMOVE_ELEMENTS = [
-    'script', 'style', 'noscript', 'iframe', 'svg', 'canvas',
+    'script:not([type="application/ld+json"])', // Keep JSON-LD scripts
+    'style', 'noscript', 'iframe', 'svg', 'canvas',
     'video', 'audio', 'object', 'embed', 'applet'
 ];
 
@@ -84,8 +101,66 @@ const HIDDEN_SELECTORS = [
     '[style*="visibility: hidden"]', '[style*="visibility:hidden"]'
 ];
 
-// Minimum text length for paragraphs (low threshold to capture prices like "$24")
-const MIN_PARAGRAPH_LENGTH = 2;
+/**
+ * Extract all visible text from DOM in document order.
+ * Includes: text nodes, aria-labels, title attributes, alt text.
+ */
+function extractVisibleText(document: Document): string {
+    const textParts: string[] = [];
+    const body = document.body;
+    if (!body) return '';
+
+    // TreeWalker to get all text nodes in DOM order
+    const walker = document.createTreeWalker(
+        body,
+        // NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT
+        1 | 4, // SHOW_ELEMENT = 1, SHOW_TEXT = 4
+        null
+    );
+
+    let node: Node | null = walker.currentNode;
+    while (node) {
+        if (node.nodeType === 3) { // Text node
+            const text = node.textContent?.trim();
+            if (text && text.length > 0) {
+                textParts.push(text);
+            }
+        } else if (node.nodeType === 1) { // Element node
+            const el = node as Element;
+
+            // Extract aria-label
+            const ariaLabel = el.getAttribute('aria-label');
+            if (ariaLabel?.trim()) {
+                textParts.push(ariaLabel.trim());
+            }
+
+            // Extract title attribute
+            const title = el.getAttribute('title');
+            if (title?.trim()) {
+                textParts.push(title.trim());
+            }
+
+            // Extract alt text from images
+            if (el.tagName === 'IMG') {
+                const alt = el.getAttribute('alt');
+                if (alt?.trim()) {
+                    textParts.push(alt.trim());
+                }
+            }
+        }
+        node = walker.nextNode();
+    }
+
+    // Deduplicate consecutive identical strings and join
+    const deduped: string[] = [];
+    for (const text of textParts) {
+        if (deduped.length === 0 || deduped[deduped.length - 1] !== text) {
+            deduped.push(text);
+        }
+    }
+
+    return deduped.join('\n');
+}
 
 /**
  * Clean the DOM and extract structured content.
@@ -102,20 +177,52 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
         let elementsRemoved = 0;
 
         // Parse HTML with virtual console to suppress CSS parsing warnings
-        // jsdom doesn't fully support modern CSS (nested selectors, CSS variables)
-        // but we remove style elements anyway, so these warnings are safe to ignore
         const virtualConsole = new VirtualConsole();
         virtualConsole.on('error', () => { /* suppress CSS parsing errors */ });
 
         const dom = new JSDOM(rawHtml, { virtualConsole });
         const document = dom.window.document;
 
-        // 1. Remove script, style, noscript, etc.
-        REMOVE_ELEMENTS.forEach(tag => {
-            const elements = document.querySelectorAll(tag);
-            elements.forEach(el => el.remove());
-            elementsRemoved += elements.length;
+        // DISABLED: JSON-LD extraction temporarily disabled for evaluation
+        // This forces the pipeline to generate Schema.org data solely from visible content
+        // const jsonLd: object[] = [];
+        // document.querySelectorAll('script[type="application/ld+json"]').forEach(script => {
+        //     try {
+        //         const content = script.textContent?.trim();
+        //         if (content) {
+        //             const parsed = JSON.parse(content);
+        //             jsonLd.push(parsed);
+        //         }
+        //     } catch {
+        //         // Invalid JSON, skip
+        //     }
+        // });
+        // log.debug('Extracted JSON-LD', { count: jsonLd.length });
+
+        // 0.1 Extract meta tags BEFORE cleanup
+        const meta: MetaElement[] = [];
+        document.querySelectorAll('meta[name], meta[property]').forEach(metaEl => {
+            const name = metaEl.getAttribute('name');
+            const property = metaEl.getAttribute('property');
+            const content = metaEl.getAttribute('content');
+            if (content) {
+                meta.push({ name, property, content });
+            }
         });
+        log.debug('Extracted meta tags', { count: meta.length });
+
+        // 1. Remove script (except JSON-LD), style, noscript, etc.
+        REMOVE_ELEMENTS.forEach(selector => {
+            try {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+                elementsRemoved += elements.length;
+            } catch {
+                // Invalid selector, skip
+            }
+        });
+        // Now remove JSON-LD scripts too (we already extracted them)
+        document.querySelectorAll('script[type="application/ld+json"]').forEach(el => el.remove());
         log.debug('Removed dangerous elements', { count: elementsRemoved });
 
         // 2. Remove hidden elements
@@ -182,13 +289,11 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
             const headers: string[] = [];
             const rows: string[][] = [];
 
-            // Get headers
             table.querySelectorAll('th').forEach(th => {
                 const text = th.textContent?.trim();
                 if (text) headers.push(text);
             });
 
-            // Get rows
             table.querySelectorAll('tbody tr, tr').forEach(tr => {
                 const cells: string[] = [];
                 tr.querySelectorAll('td').forEach(td => {
@@ -218,7 +323,18 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
         });
         log.debug('Extracted images', { count: images.length });
 
-        // 8. Extract buttons/CTAs
+        // 8. Extract links
+        const links: LinkElement[] = [];
+        document.querySelectorAll('a[href]').forEach(a => {
+            const text = a.textContent?.trim();
+            const href = a.getAttribute('href');
+            if (text && href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                links.push({ text, href });
+            }
+        });
+        log.debug('Extracted links', { count: links.length });
+
+        // 9. Extract buttons/CTAs
         const buttons: ButtonElement[] = [];
         document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], .btn, .button').forEach(btn => {
             const text = btn.textContent?.trim() || (btn as HTMLInputElement).value;
@@ -228,34 +344,12 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
         });
         log.debug('Extracted buttons', { count: buttons.length });
 
-        // 9. Get cleaned HTML
+        // 10. Get cleaned HTML
         const body = document.body;
         const cleanedHtml = body ? body.innerHTML : '';
 
-        // 10. Extract visible text (filter short paragraphs)
-        const visibleTextParts: string[] = [];
-
-        // Add headings
-        headings.forEach(h => visibleTextParts.push(h.text));
-
-        // Add paragraphs
-        document.querySelectorAll('p').forEach(p => {
-            const text = p.textContent?.trim();
-            if (text && text.length >= MIN_PARAGRAPH_LENGTH) {
-                visibleTextParts.push(text);
-            }
-        });
-
-        // Add list items
-        lists.forEach(list => {
-            list.items.forEach(item => {
-                if (item.length >= MIN_PARAGRAPH_LENGTH) {
-                    visibleTextParts.push(item);
-                }
-            });
-        });
-
-        const visibleText = visibleTextParts.join('\n\n');
+        // 11. Extract ALL visible text (comprehensive, unfiltered)
+        const visibleText = extractVisibleText(document);
         const cleanedLength = cleanedHtml.length;
 
         // Rough token estimate (1 token ≈ 4 chars for English)
@@ -269,7 +363,10 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
             headingsCount: headings.length,
             listsCount: lists.length,
             tablesCount: tables.length,
-            imagesCount: images.length
+            imagesCount: images.length,
+            linksCount: links.length,
+            metaCount: meta.length
+            // jsonLdCount: jsonLd.length  // DISABLED
         });
 
         return {
@@ -279,7 +376,10 @@ export function clean(rawHtml: string): CleaningResult | CleaningError {
             lists,
             tables,
             images,
+            links,
             buttons,
+            meta,
+            // jsonLd,  // DISABLED: JSON-LD extraction temporarily disabled
             stats: {
                 originalLength,
                 cleanedLength,

@@ -2,47 +2,40 @@
  * Pipeline Index
  * 
  * Exports all pipeline modules and the main pipeline runner.
+ * 
+ * Simplified Pipeline:
+ * Ingestion → Cleaning → Extraction AI → Validator
  */
 
 import fs from 'fs';
 import path from 'path';
 
 export { ingest, type IngestionResult, type IngestionError } from './ingestion';
-export { clean, type CleaningResult, type CleaningError } from './cleaning';
-export { flattenHtml, type FlattenResult } from './flatten';
-export { extractVisibility, type VisibilitySuccess, type VisibilityError } from './visibility-extractor';
-export { mergeVisibleText, mergeWithStats, type MergeResult } from './merge';
+export { clean, type CleaningResult, type CleaningError, type LinkElement, type MetaElement } from './cleaning';
 export { extract, type ExtractionSuccess, type ExtractionError } from './extraction';
-export { validate, type ValidationSuccess, type ValidationError } from './validator';
+export { validateMultiEntity, type ValidationSuccess, type ValidationError, type RejectedEntity } from './validator';
 
 import { ingest } from './ingestion';
 import { clean } from './cleaning';
-import { flattenHtml } from './flatten';
-import { extractVisibility } from './visibility-extractor';
-import { mergeVisibleText } from './merge';
 import { extract } from './extraction';
-import { validate } from './validator';
+import { validateMultiEntity } from './validator';
 import { logger, type LogEntry } from '../logger';
 
 export interface PipelineSuccess {
     success: true;
-    jsonLd: object;
-    detectedType: string;
+    acceptedEntities: object[];  // Array of valid JSON-LD objects
+    rejectedEntities: import('./validator').RejectedEntity[];  // Array of rejected entities with reasons
+    jsonLd: object[];  // Backward compatibility alias for acceptedEntities
+    entityTypes: string[];  // Types of accepted entities only
     repairs: string[];
     logs: LogEntry[];
     stats: {
         ingestionTimeMs: number;
         cleaningTimeMs: number;
-        visibilityTimeMs: number;
         extractionTimeMs: number;
         validationTimeMs: number;
         totalTimeMs: number;
         tokenUsage: {
-            promptTokens: number;
-            completionTokens: number;
-            totalTokens: number;
-        };
-        visibilityTokenUsage?: {
             promptTokens: number;
             completionTokens: number;
             totalTokens: number;
@@ -52,7 +45,7 @@ export interface PipelineSuccess {
 
 export interface PipelineError {
     success: false;
-    stage: 'ingestion' | 'cleaning' | 'visibility' | 'extraction' | 'validator';
+    stage: 'ingestion' | 'cleaning' | 'extraction' | 'validator';
     reason: string;
     logs: LogEntry[];
 }
@@ -136,6 +129,12 @@ function saveOutput(filename: string, content: string | object, prettyHtml = fal
 
 /**
  * Run the full pipeline: Ingest → Clean → Extract → Validate
+ * 
+ * Simplified flow:
+ * 1. Ingestion: Fetch HTML via Playwright
+ * 2. Cleaning: DOM cleanup + comprehensive text extraction (single source of truth)
+ * 3. Extraction: AI maps content to Schema.org types
+ * 4. Validation: Zod validation + repairs → Final JSON-LD
  */
 export async function runPipeline(url: string): Promise<PipelineSuccess | PipelineError> {
     // Clear logs from previous runs
@@ -165,7 +164,7 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
     // Save Step 1 output: Raw HTML
     saveOutput(`step1_raw_html_${timestamp}.html`, successIngestion.rawHtml, true);
 
-    // Step 2: Cleaning
+    // Step 2: Cleaning (single source of truth for text extraction)
     const cleaningStart = Date.now();
     const cleaningResult = clean(successIngestion.rawHtml);
     const cleaningTimeMs = Date.now() - cleaningStart;
@@ -182,7 +181,7 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
     // At this point, cleaningResult is CleaningResult (success case)
     const successCleaning = cleaningResult as Exclude<typeof cleaningResult, { success: false }>;
 
-    // Save Step 2 outputs: Cleaned HTML and Visible Text
+    // Save Step 2 outputs
     saveOutput(`step2_cleaned_html_${timestamp}.html`, successCleaning.cleanedHtml, true);
     saveOutput(`step2_visible_text_${timestamp}.txt`, successCleaning.visibleText);
     saveOutput(`step2_structured_data_${timestamp}.json`, {
@@ -190,73 +189,30 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
         lists: successCleaning.lists,
         tables: successCleaning.tables,
         images: successCleaning.images.slice(0, 10), // Limit images for readability
+        links: successCleaning.links.slice(0, 20),   // Limit links for readability
         buttons: successCleaning.buttons,
+        meta: successCleaning.meta,
+        // jsonLd: successCleaning.jsonLd,  // DISABLED
         stats: successCleaning.stats
     });
 
-    // Step 2.4: Flatten HTML (deterministic)
-    const flattenResult = flattenHtml(successCleaning.cleanedHtml);
-    saveOutput(`step2.4_flattened_${timestamp}.txt`, flattenResult.flattenedText);
-
-    logger.info('Pipeline', 'HTML flattening complete', {
-        originalLength: flattenResult.stats.originalLength,
-        flattenedLength: flattenResult.stats.flattenedLength,
-        reductionPercent: flattenResult.stats.reductionPercent,
-        lineCount: flattenResult.stats.lineCount
+    logger.info('Pipeline', 'Cleaning complete', {
+        visibleTextLength: successCleaning.visibleText.length,
+        headingsCount: successCleaning.headings.length,
+        linksCount: successCleaning.links.length,
+        metaCount: successCleaning.meta.length,
+        // jsonLdCount: successCleaning.jsonLd.length,  // DISABLED
+        tokenEstimate: successCleaning.stats.tokenEstimate
     });
 
-    // Step 2.5: Visibility Extraction (graceful failure)
-    const visibilityStart = Date.now();
-    let visibleTextPlus = successCleaning.visibleText;
-    let visibilityTokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
-    let visibilityFacts: string[] = [];
-
-    try {
-        // Use flattened text instead of cleanedHtml to reduce tokens
-        const visibilityResult = await extractVisibility(flattenResult.flattenedText);
-
-        if (visibilityResult.success) {
-            visibilityFacts = visibilityResult.facts;
-            visibilityTokenUsage = visibilityResult.tokenUsage;
-
-            // Step 2.6: Deterministic Merge
-            visibleTextPlus = mergeVisibleText(visibilityFacts, successCleaning.visibleText);
-
-            // Save visibility output
-            saveOutput(`step2.5_visibility_${timestamp}.json`, {
-                facts: visibilityFacts,
-                tokenUsage: visibilityTokenUsage,
-                durationMs: visibilityResult.durationMs
-            });
-
-            logger.info('Pipeline', 'Visibility extraction complete', {
-                factCount: visibilityFacts.length,
-                sampleFacts: visibilityFacts.slice(0, 5)
-            });
-        } else {
-            logger.warn('Pipeline', 'Visibility extraction failed, continuing with original visibleText', {
-                reason: visibilityResult.reason
-            });
-        }
-    } catch (error) {
-        logger.warn('Pipeline', 'Visibility extraction error, continuing with original visibleText', {
-            error: error instanceof Error ? error.message : 'Unknown error'
-        });
-    }
-    const visibilityTimeMs = Date.now() - visibilityStart;
-
-    // Save enhanced visible text
-    saveOutput(`step2_visible_text_${timestamp}.txt`, visibleTextPlus);
-
-    // Create enhanced cleaning result with merged text
-    const enhancedCleaning = {
-        ...successCleaning,
-        visibleText: visibleTextPlus
-    };
-
-    // Step 3: Extraction
+    // Step 3: Extraction (AI maps content to Schema.org)
     const extractionStart = Date.now();
-    const extractionResult = await extract(enhancedCleaning, successIngestion.finalUrl);
+    // Create a timestamped save function for extraction debugging
+    const saveExtractionDebug = (filename: string, content: string | object) => {
+        const name = filename.replace('.', `_${timestamp}.`);
+        saveOutput(name, content);
+    };
+    const extractionResult = await extract(successCleaning, successIngestion.finalUrl, saveExtractionDebug);
     const extractionTimeMs = Date.now() - extractionStart;
 
     // Save Step 3 output: AI extraction result
@@ -271,12 +227,12 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
         };
     }
 
-    // Step 4: Validation
+    // Step 4: Validation (Multi-Entity)
     const validationStart = Date.now();
-    const validationResult = validate(extractionResult.data, successIngestion.finalUrl);
+    const validationResult = validateMultiEntity(extractionResult.data, successIngestion.finalUrl);
     const validationTimeMs = Date.now() - validationStart;
 
-    // Save Step 4 output: Final JSON-LD
+    // Save Step 4 output: Final JSON-LD array
     saveOutput(`step4_jsonld_${timestamp}.json`, validationResult);
 
     if (!validationResult.success) {
@@ -291,26 +247,36 @@ export async function runPipeline(url: string): Promise<PipelineSuccess | Pipeli
     const totalTimeMs = Date.now() - pipelineStart;
 
     logger.info('Pipeline', 'Pipeline complete', {
-        detectedType: validationResult.detectedType,
+        acceptedEntities: validationResult.acceptedEntities.length,
+        rejectedEntities: validationResult.rejectedEntities.length,
+        entityTypes: validationResult.entityTypes,
         totalTimeMs,
         outputDir: OUTPUT_DIR
     });
 
+    // Log rejected entities for transparency
+    if (validationResult.rejectedEntities.length > 0) {
+        logger.warn('Pipeline', 'Some entities were rejected during validation', {
+            rejectedCount: validationResult.rejectedEntities.length,
+            rejectedTypes: validationResult.rejectedEntities.map(e => e['@type'])
+        });
+    }
+
     return {
         success: true,
-        jsonLd: validationResult.jsonLd,
-        detectedType: validationResult.detectedType,
+        acceptedEntities: validationResult.acceptedEntities,
+        rejectedEntities: validationResult.rejectedEntities,
+        jsonLd: validationResult.jsonLd,  // Backward compatibility alias
+        entityTypes: validationResult.entityTypes,
         repairs: validationResult.repairs,
         logs: logger.getLogs(),
         stats: {
             ingestionTimeMs,
             cleaningTimeMs,
-            visibilityTimeMs,
             extractionTimeMs,
             validationTimeMs,
             totalTimeMs,
-            tokenUsage: extractionResult.tokenUsage,
-            visibilityTokenUsage
+            tokenUsage: extractionResult.tokenUsage
         }
     };
 }

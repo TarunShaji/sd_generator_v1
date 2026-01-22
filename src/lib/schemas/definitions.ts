@@ -1,255 +1,252 @@
 import { z } from 'zod';
 
-// --- Shared Helpers ---
-const numericString = z.union([z.number(), z.string()]).nullable().describe("Extract as-is. Repair logic will clean it later.");
-const urlString = z.string().url().nullable().describe("Must be an absolute URL.");
-const isoDate = z.string().nullable().describe("Prefer ISO 8601 format (YYYY-MM-DD).");
-const personOrOrg = z.object({ type: z.enum(['Person', 'Organization']).nullable(), name: z.string().nullable(), url: urlString }).nullable();
+// ============================================================================
+// SCHEMA CONTRACTS (Extraction Stage)
+// ============================================================================
+// These define the "shape" of data we want the AI to look for.
+// They are NOT validators. They are contracts.
+//
+// RULES:
+// 1. All fields must be optional/nullable (never crash on missing data).
+// 2. All schemas must be .passthrough() (never crash on extra fields).
+// 3. Types should be loose (string | number for numbers, string for URLs).
+// 4. Strict validation belongs in the Validator (Step 4), not here.
 
-// --- 1. Product (Enhanced) ---
-// Covers Google Rich Results requirements + common real-world fields
-const BrandSchema = z.object({
-  name: z.string().nullable()
-}).nullable();
+// --- Core Primitives (Loose) ---
+const CoreString = z.string().nullable().optional();
+const CoreNumber = z.union([z.number(), z.string()]).nullable().optional();
+const CoreUrl = z.string().nullable().optional(); // Accepts relative URLs
+const CoreDate = z.string().nullable().optional(); // Accepts any date string
+const CoreBoolean = z.boolean().nullable().optional();
 
-const AggregateRatingSchema = z.object({
-  ratingValue: numericString,
-  reviewCount: numericString,
-  bestRating: numericString,  // Usually 5
-  worstRating: numericString  // Usually 1
-}).nullable();
+// --- Shared Helpers (Contracts) ---
+const BrandContract = z.object({
+  '@type': z.string().optional(),
+  name: CoreString
+}).passthrough().nullable().optional();
 
-const OfferSchema = z.object({
-  // REQUIRED fields
-  price: numericString,
-  priceCurrency: z.string().nullable(),
-  availability: z.enum([
-    'https://schema.org/InStock',
-    'https://schema.org/OutOfStock',
-    'https://schema.org/PreOrder',
-    'https://schema.org/SoldOut',
-    'https://schema.org/BackOrder',
-    'https://schema.org/Discontinued',
-    'https://schema.org/LimitedAvailability'
-  ]).nullable(),
+const OrganizationContract = z.object({
+  '@type': z.string().optional(),
+  name: CoreString,
+  url: CoreUrl,
+  logo: CoreUrl,
+  sameAs: z.array(z.string()).nullable().optional()
+}).passthrough().nullable().optional();
 
-  // RECOMMENDED fields
-  url: urlString,
-  priceValidUntil: isoDate,
-  itemCondition: z.enum([
-    'https://schema.org/NewCondition',
-    'https://schema.org/UsedCondition',
-    'https://schema.org/RefurbishedCondition',
-    'https://schema.org/DamagedCondition'
-  ]).nullable(),
+const PersonOrOrgContract = z.union([
+  OrganizationContract,
+  z.object({
+    '@type': z.string().optional(),
+    name: CoreString,
+    url: CoreUrl
+  }).passthrough()
+]).nullable().optional();
 
-  // Additional useful fields
-  sku: z.string().nullable(),
-  seller: z.object({ name: z.string().nullable() }).nullable(),
-  shippingDetails: z.object({
-    shippingRate: z.object({
-      value: numericString,
-      currency: z.string().nullable()
-    }).nullable(),
-    deliveryTime: z.object({
-      minValue: numericString,
-      maxValue: numericString,
-      unitCode: z.string().nullable()  // e.g., "DAY"
-    }).nullable()
-  }).nullable(),
-  hasMerchantReturnPolicy: z.object({
-    returnPolicyCategory: z.enum([
-      'https://schema.org/MerchantReturnFiniteReturnWindow',
-      'https://schema.org/MerchantReturnNotPermitted',
-      'https://schema.org/MerchantReturnUnlimitedWindow'
-    ]).nullable(),
-    merchantReturnDays: numericString
-  }).nullable()
-}).nullable();
+const ImageContract = z.union([
+  CoreUrl,
+  z.array(z.string()),
+  z.object({ url: CoreUrl }).passthrough()
+]).nullable().optional();
 
-const ProductSchema = z.object({
-  // REQUIRED
-  name: z.string().nullable(),
-  image: z.array(z.string()).nullable(),
+const OfferContract = z.object({
+  '@type': z.string().optional(),
+  price: CoreNumber,
+  priceCurrency: CoreString,
+  availability: CoreString, // "InStock" or "https://schema.org/InStock"
+  url: CoreUrl,
+  priceValidUntil: CoreDate,
+  itemCondition: CoreString,
+  sku: CoreString,
+  seller: OrganizationContract
+}).passthrough().nullable().optional();
 
-  // RECOMMENDED  
-  description: z.string().nullable(),
-  brand: BrandSchema,
-  offers: z.union([OfferSchema, z.array(OfferSchema)]).nullable(),
-  aggregateRating: AggregateRatingSchema,
+const AggregateRatingContract = z.object({
+  '@type': z.string().optional(),
+  ratingValue: CoreNumber,
+  reviewCount: CoreNumber,
+  bestRating: CoreNumber,
+  worstRating: CoreNumber
+}).passthrough().nullable().optional();
 
-  // Identifiers (important for e-commerce)
-  sku: z.string().nullable(),
-  gtin: z.string().nullable(),        // GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), GTIN-14
-  mpn: z.string().nullable(),         // Manufacturer Part Number
-  productID: z.string().nullable(),   // Generic product ID
+// ============================================================================
+// ENTITY CONTRACTS
+// ============================================================================
 
-  // Product variants/attributes
-  color: z.string().nullable(),
-  size: z.string().nullable(),
-  material: z.string().nullable(),
-  pattern: z.string().nullable(),
+// 1. Product Contract
+// We list fields to "hint" to the AI what we care about, but .passthrough() allows anything.
+const ProductContract = z.object({
+  '@type': z.literal('Product'),
+  name: CoreString,
+  description: CoreString,
+  image: ImageContract,
+  brand: BrandContract,
+  offers: z.union([OfferContract, z.array(OfferContract)]).nullable().optional(),
+  aggregateRating: AggregateRatingContract,
+  sku: CoreString,
+  gtin: CoreString,
+  mpn: CoreString
+}).passthrough();
 
-  // Physical properties
-  weight: z.object({
-    value: numericString,
-    unitCode: z.string().nullable()   // e.g., "KGM", "LBR"
-  }).nullable(),
+// 2. Article / BlogPosting Contract
+const ArticleContract = z.object({
+  '@type': z.enum(['Article', 'BlogPosting', 'NewsArticle']),
+  headline: CoreString,
+  name: CoreString, // Alias for headline
+  description: CoreString,
+  image: ImageContract,
+  author: PersonOrOrgContract,
+  publisher: OrganizationContract,
+  datePublished: CoreDate,
+  dateModified: CoreDate,
+  mainEntityOfPage: CoreUrl
+}).passthrough();
 
-  // Category
-  category: z.string().nullable(),     // Product category/type
+// 3. Organization Contract (Top-level)
+const OrganizationEntityContract = z.object({
+  '@type': z.enum(['Organization', 'Corporation', 'LocalBusiness', 'Store', 'Restaurant']),
+  name: CoreString,
+  url: CoreUrl,
+  logo: ImageContract,
+  description: CoreString,
+  sameAs: z.array(z.string()).nullable().optional(),
+  contactPoint: z.any().optional(),
+  address: z.any().optional()
+}).passthrough();
 
-  // Reviews
-  review: z.array(z.object({
-    author: z.object({ name: z.string().nullable() }).nullable(),
-    reviewRating: z.object({
-      ratingValue: numericString,
-      bestRating: numericString
-    }).nullable(),
-    reviewBody: z.string().nullable(),
-    datePublished: isoDate
-  })).nullable()
+// 4. ItemList Contract (Collections)
+const ItemListContract = z.object({
+  '@type': z.literal('ItemList'),
+  name: CoreString,
+  description: CoreString,
+  numberOfItems: CoreNumber,
+  itemListElement: z.array(
+    z.object({
+      '@type': z.literal('ListItem').optional(),
+      position: CoreNumber,
+      url: CoreUrl, // Allows relative
+      name: CoreString,
+      image: ImageContract
+    }).passthrough()
+  ).nullable().optional()
+}).passthrough();
+
+// 5. Recipe Contract
+const RecipeContract = z.object({
+  '@type': z.literal('Recipe'),
+  name: CoreString,
+  description: CoreString,
+  image: ImageContract,
+  author: PersonOrOrgContract,
+  cookTime: CoreString,
+  prepTime: CoreString,
+  totalTime: CoreString,
+  recipeYield: CoreString,
+  recipeIngredient: z.array(z.string()).nullable().optional(),
+  recipeInstructions: z.array(z.any()).nullable().optional(),
+  aggregateRating: AggregateRatingContract,
+  nutrition: z.any().optional()
+}).passthrough();
+
+// 6. Review Contract
+const ReviewContract = z.object({
+  '@type': z.literal('Review'),
+  author: PersonOrOrgContract,
+  reviewRating: AggregateRatingContract,
+  reviewBody: CoreString,
+  datePublished: CoreDate
+}).passthrough();
+
+// 7. VideoObject Contract
+const VideoObjectContract = z.object({
+  '@type': z.literal('VideoObject'),
+  name: CoreString,
+  description: CoreString,
+  thumbnailUrl: ImageContract,
+  uploadDate: CoreDate,
+  duration: CoreString,
+  contentUrl: CoreUrl,
+  embedUrl: CoreUrl
+}).passthrough();
+
+// 8. FAQPage Contract
+const FAQPageContract = z.object({
+  '@type': z.literal('FAQPage'),
+  mainEntity: z.array(
+    z.object({
+      '@type': z.literal('Question'),
+      name: CoreString,
+      acceptedAnswer: z.object({
+        '@type': z.literal('Answer'),
+        text: CoreString
+      }).passthrough().nullable().optional()
+    }).passthrough()
+  ).nullable().optional()
+}).passthrough();
+
+// 9. WebSite Contract (Search Action)
+const WebSiteContract = z.object({
+  '@type': z.literal('WebSite'),
+  name: CoreString,
+  url: CoreUrl,
+  potentialAction: z.any().optional() // Allow any search action structure
+}).passthrough();
+
+// 10. BreadcrumbList Contract
+const BreadcrumbListContract = z.object({
+  '@type': z.literal('BreadcrumbList'),
+  itemListElement: z.array(z.any()).nullable().optional()
+}).passthrough();
+
+
+// ============================================================================
+// MASTER EXTRACTOR SCHEMA
+// ============================================================================
+
+// This is the container we ask the AI to fill.
+// It allows a list of ANY of our contracts.
+export const MultiEntityExtractionSchema = z.object({
+  schemas: z.array(
+    z.union([
+      ProductContract,
+      ArticleContract,
+      OrganizationEntityContract,
+      ItemListContract,
+      RecipeContract,
+      ReviewContract,
+      VideoObjectContract,
+      FAQPageContract,
+      WebSiteContract,
+      BreadcrumbListContract,
+      // Fallback for any other valid Schema.org type
+      z.object({
+        '@type': z.string()
+      }).passthrough()
+    ])
+  )
 });
 
 
-// --- 2. Recipe ---
-const RecipeSchema = z.object({
-  name: z.string().nullable(),
-  image: z.array(z.string()).nullable(),
-  author: personOrOrg,
-  datePublished: isoDate,
-  prepTime: z.string().nullable(),
-  cookTime: z.string().nullable(),
-  totalTime: z.string().nullable(),
-  recipeYield: z.string().nullable(),
-  nutrition: z.object({ calories: z.string().nullable(), proteinContent: z.string().nullable() }).nullable(),
-  recipeIngredient: z.array(z.string()).nullable(),
-  recipeInstructions: z.array(z.object({ type: z.literal("HowToStep").default("HowToStep"), text: z.string().nullable() })).nullable()
-});
+// ============================================================================
+// EXPORTED TYPES (For internal use in Pipeline)
+// ============================================================================
 
-// --- 3. Event ---
-const EventSchema = z.object({
-  name: z.string().nullable(),
-  startDate: isoDate,
-  endDate: isoDate,
-  eventStatus: z.enum(['https://schema.org/EventScheduled', 'https://schema.org/EventCancelled', 'https://schema.org/EventMovedOnline', 'https://schema.org/EventPostponed']).nullable(),
-  location: z.object({ name: z.string().nullable(), address: z.object({ streetAddress: z.string().nullable(), addressLocality: z.string().nullable(), addressCountry: z.string().nullable() }).nullable() }).nullable(),
-  offers: z.object({ price: numericString, priceCurrency: z.string().nullable(), url: urlString }).nullable()
-});
+export type MultiEntityResult = z.infer<typeof MultiEntityExtractionSchema>;
+// export type EntityTypeName = MultiEntityResult['schemas'][number]['@type']; 
+// Use a broader string type since we allow passthrough
+export type EntityTypeName = string;
 
-// --- 4. Local Business ---
-const LocalBusinessSchema = z.object({
-  name: z.string().nullable(),
-  image: z.array(z.string()).nullable(),
-  telephone: z.string().nullable(),
-  address: z.object({ streetAddress: z.string().nullable(), addressLocality: z.string().nullable(), addressRegion: z.string().nullable(), postalCode: z.string().nullable() }).nullable(),
-  geo: z.object({ latitude: numericString, longitude: numericString }).nullable(),
-  openingHours: z.array(z.string()).nullable(),
-  priceRange: z.string().nullable()
-});
-
-// --- 5. Article (Enhanced) ---
-// Supports E-E-A-T requirements, Google News, and rich snippets
-// Simplified for AI compatibility while keeping all enhanced fields
-
-const ArticleSchema = z.object({
-  // HEADLINES & DESCRIPTION
-  headline: z.string().nullable(),
-  alternativeHeadline: z.string().nullable(),
-  description: z.string().nullable(),
-
-  // IMAGES (simplified - array of URLs)
-  image: z.array(z.string()).nullable(),
-
-  // E-E-A-T: AUTHORSHIP (simplified - single author or first author for multi-author)
-  author: z.object({
-    type: z.enum(['Person', 'Organization']).nullable(),
-    name: z.string().nullable(),
-    url: urlString
-  }).nullable(),
-
-  // Additional authors for co-authored articles
-  additionalAuthors: z.array(z.object({
-    type: z.enum(['Person', 'Organization']).nullable(),
-    name: z.string().nullable(),
-    url: urlString
-  })).nullable(),
-
-  // PUBLISHER
-  publisher: z.object({
-    name: z.string().nullable(),
-    logoUrl: urlString,
-    logoWidth: numericString,
-    logoHeight: numericString
-  }).nullable(),
-
-  // DATES
-  datePublished: isoDate,
-  dateModified: isoDate,
-
-  // CONTENT METRICS & CATEGORIES
-  articleSection: z.string().nullable(),  // Primary category
-  keywords: z.array(z.string()).nullable(),
-  wordCount: numericString,
-
-  // PAYWALL / ACCESS
-  isAccessibleForFree: z.boolean().nullable(),
-
-  // SEO TECHNICALS
-  mainEntityOfPage: urlString,
-
-  // ADDITIONAL USEFUL FIELDS
-  inLanguage: z.string().nullable(),
-  copyrightHolder: z.string().nullable(),
-  copyrightYear: numericString,
-  thumbnailUrl: urlString
-});
-
-// --- 6. FAQ Page ---
-const FAQSchema = z.object({
-  mainEntity: z.array(z.object({ type: z.literal("Question").default("Question"), name: z.string().nullable(), acceptedAnswer: z.object({ type: z.literal("Answer").default("Answer"), text: z.string().nullable() }).nullable() })).nullable()
-});
-
-// --- 7. How-To ---
-const HowToSchema = z.object({
-  name: z.string().nullable(),
-  step: z.array(z.object({ type: z.literal("HowToStep").default("HowToStep"), url: urlString, name: z.string().nullable(), text: z.string().nullable(), image: urlString })).nullable(),
-  totalTime: z.string().nullable(),
-  tool: z.array(z.object({ name: z.string().nullable() })).nullable(),
-  supply: z.array(z.object({ name: z.string().nullable() })).nullable()
-});
-
-// --- 8. Fallback: WebPage ---
-const WebPageSchema = z.object({
-  name: z.string().nullable(),
-  description: z.string().nullable(),
-  datePublished: isoDate,
-  dateModified: isoDate,
-  breadcrumb: z.array(z.string()).nullable()
-});
-
-// --- MASTER CONTAINER ---
-export const ExtractionSchema = z.object({
-  detectedType: z.enum(['Product', 'Recipe', 'Event', 'LocalBusiness', 'FAQPage', 'Article', 'BlogPosting', 'HowTo', 'WebPage']),
-  product: ProductSchema.nullable(),
-  recipe: RecipeSchema.nullable(),
-  event: EventSchema.nullable(),
-  localBusiness: LocalBusinessSchema.nullable(),
-  faq: FAQSchema.nullable(),
-  article: ArticleSchema.nullable(),
-  blogPosting: ArticleSchema.nullable(),
-  howto: HowToSchema.nullable(),
-  webPage: WebPageSchema.nullable()
-});
-
-// Export types for use in other modules
-export type ExtractionResult = z.infer<typeof ExtractionSchema>;
-export type Product = z.infer<typeof ProductSchema>;
-export type Recipe = z.infer<typeof RecipeSchema>;
-export type Event = z.infer<typeof EventSchema>;
-export type LocalBusiness = z.infer<typeof LocalBusinessSchema>;
-export type Article = z.infer<typeof ArticleSchema>;
-export type FAQ = z.infer<typeof FAQSchema>;
-export type HowTo = z.infer<typeof HowToSchema>;
-export type WebPage = z.infer<typeof WebPageSchema>;
-export type DetectedType = ExtractionResult['detectedType'];
+// Re-export specific schemas if needed by other components (e.g. Validator)
+// Note: Validator should ideally use its own strict schemas, but can use these for loose typing.
+export {
+  ProductContract as ProductSchema,
+  ArticleContract as ArticleSchema,
+  OrganizationEntityContract as OrganizationSchema,
+  ItemListContract as ItemListSchema,
+  RecipeContract as RecipeSchema,
+  FAQPageContract as FAQSchema,
+  WebSiteContract as WebSiteSchema,
+  VideoObjectContract as VideoObjectSchema,
+  BrandContract as BrandSchema,
+  OfferContract as OfferSchema,
+  AggregateRatingContract as AggregateRatingSchema
+};
